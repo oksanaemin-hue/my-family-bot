@@ -10,7 +10,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiohttp import web
 
 # === НАЛАШТУВАННЯ ===
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_BOT_TOKEN = "9048278041:AAGLR_CPZP636L6-4JPi_F1bdGn3PrWk1Yc"
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
