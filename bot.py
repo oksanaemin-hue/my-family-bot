@@ -4,16 +4,26 @@ import os
 import sqlite3
 from datetime import datetime, timedelta
 import re
+
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiohttp import web
 
 # === НАЛАШТУВАННЯ ТОКЕНА ===
-TELEGRAM_BOT_TOKEN = "9048278041:AAGLR_CPZP636L6-4JPi_F1bdGn3PrWk1Yc" # 
+TELEGRAM_BOT_TOKEN = "9048278041:AAGLR_CPZP636L6-4JPi_F1bdGn3PrWk1Yc"  # 
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
+
+# === СТАНИ (FSM) ДЛЯ ДІАЛОГУ ===
+class Form(StatesGroup):
+    waiting_for_shopping_items = State()
+    waiting_for_reminder_title = State()
+    waiting_for_reminder_date = State()
 
 # === ВЕБ-СЕРВЕР ДЛЯ RENDER ===
 async def handle_ping(request):
@@ -52,13 +62,14 @@ def init_db():
 
 init_db()
 
-# === КЛАВІАТУРА МЕНЮ ===
+# === ОСНОВНЕ МЕНЮ (КНОПКИ ВНИЗУ) ===
 def main_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.button(text="🛒 Список покупок")
+    builder.button(text="➕ Додати в список")
     builder.button(text="⏰ Мої нагадування")
-    builder.button(text="❓ Допомога")
-    builder.adjust(2, 1)
+    builder.button(text="🔔 Додати нагадування")
+    builder.adjust(2, 2)
     return builder.as_markup(resize_keyboard=True)
 
 # === ТАЙМЕР НАГАДУВАНЬ ===
@@ -81,45 +92,22 @@ async def check_reminders():
         conn.close()
         await asyncio.sleep(30)
 
-# === ХЕНДЛЕРИ ===
-
+# === СТАРТ ТА СКАСУВАННЯ ===
 @dp.message(Command("start"))
-@dp.message(F.text == "❓ Допомога")
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "👋 **Привіт! Я ваш сімейний помічник.**\n\n"
-        "Користуйтеся кнопками внизу екрана або командами:\n\n"
-        "🛒 **Покупки:**\n"
-        "• `/buy молоко, хліб, сир` — додати в список\n"
-        "• Натисніть кнопку **«🛒 Список покупок»**, щоб переглянути або викреслити товари.\n\n"
-        "⏰ **Нагадування (іпотека, ТО, страховка):**\n"
-        "• `/remind завтра о 10:00 Оплатити іпотеку`\n"
-        "• `/remind 2026-11-25 15:00 ТО авто`\n"
-        "• `/remind через 2 години Вимкнути духовку`",
+        "Оберіть потрібну дію на кнопках внизу екрана👇",
         reply_markup=main_keyboard()
     )
 
-# Додавання покупок
-@dp.message(Command("buy"))
-async def add_shopping(message: types.Message):
-    text = message.text.replace("/buy", "").strip()
-    if not text:
-        await message.answer("Вкажіть покупки через кому. Приклад: `/buy молоко, яйця`")
-        return
-    
-    items = [item.strip() for item in text.split(",") if item.strip()]
-    conn = sqlite3.connect("family_data.db")
-    cursor = conn.cursor()
-    for item in items:
-        cursor.execute("INSERT INTO shopping (item) VALUES (?)", (item,))
-    conn.commit()
-    conn.close()
-    
-    await message.answer(f"✅ Додано в список покупок ({len(items)} шт.)!", reply_markup=main_keyboard())
+# === БЛОК 1: ПОКУПКИ ===
 
+# Натиснули "🛒 Список покупок"
 @dp.message(F.text == "🛒 Список покупок")
-@dp.message(Command("list"))
-async def show_shopping_list(message: types.Message):
+async def show_shopping_list(message: types.Message, state: FSMContext):
+    await state.clear()
     conn = sqlite3.connect("family_data.db")
     cursor = conn.cursor()
     cursor.execute("SELECT id, item FROM shopping")
@@ -135,8 +123,9 @@ async def show_shopping_list(message: types.Message):
         builder.button(text=f"❌ {item_name}", callback_data=f"del_shop_{item_id}")
     builder.adjust(1)
     
-    await message.answer("🛒 **Список покупок:**\n*(натисніть на товар, щоб викреслити)*", reply_markup=builder.as_markup())
+    await message.answer("🛒 **Ваш список покупок:**\n*(натисніть на товар, щоб викреслити)*", reply_markup=builder.as_markup())
 
+# Викреслення товару зі списку
 @dp.callback_query(F.data.startswith("del_shop_"))
 async def delete_shopping_item(callback: types.CallbackQuery):
     item_id = callback.data.split("_")[2]
@@ -148,7 +137,6 @@ async def delete_shopping_item(callback: types.CallbackQuery):
     
     await callback.answer("Куплено!")
     
-    # Оновлення списку
     conn = sqlite3.connect("family_data.db")
     cursor = conn.cursor()
     cursor.execute("SELECT id, item FROM shopping")
@@ -164,9 +152,38 @@ async def delete_shopping_item(callback: types.CallbackQuery):
         builder.adjust(1)
         await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
 
-# Перегляд активних нагадувань
+# Натиснули "➕ Додати в список"
+@dp.message(F.text == "➕ Додати в список")
+async def start_add_shopping(message: types.Message, state: FSMContext):
+    await state.set_state(Form.waiting_for_shopping_items)
+    await message.answer("✍️ **Напишіть товари, які потрібно купити** (можна декілька через кому):\n\n*Приклад: молоко, хліб, яйця*")
+
+# Бот приймає написані покупки
+@dp.message(Form.waiting_for_shopping_items)
+async def process_shopping_items(message: types.Message, state: FSMContext):
+    items = [item.strip() for item in message.text.split(",") if item.strip()]
+    
+    if not items:
+        await message.answer("Будь ласка, напишіть хоча б один товар.")
+        return
+
+    conn = sqlite3.connect("family_data.db")
+    cursor = conn.cursor()
+    for item in items:
+        cursor.execute("INSERT INTO shopping (item) VALUES (?)", (item,))
+    conn.commit()
+    conn.close()
+    
+    await state.clear()
+    await message.answer(f"✅ Додано до списку покупок ({len(items)} шт.)!", reply_markup=main_keyboard())
+
+
+# === БЛОК 2: НАГАДУВАННЯ ===
+
+# Натиснули "⏰ Мої нагадування"
 @dp.message(F.text == "⏰ Мої нагадування")
-async def show_reminders(message: types.Message):
+async def show_reminders(message: types.Message, state: FSMContext):
+    await state.clear()
     conn = sqlite3.connect("family_data.db")
     cursor = conn.cursor()
     cursor.execute("SELECT title, remind_date FROM reminders WHERE chat_id = ? AND is_done = 0 ORDER BY remind_date ASC", (message.chat.id,))
@@ -183,53 +200,64 @@ async def show_reminders(message: types.Message):
     
     await message.answer(text, reply_markup=main_keyboard())
 
-# Зручне додавання нагадувань
-@dp.message(Command("remind"))
-async def add_reminder(message: types.Message):
-    raw_text = message.text.replace("/remind", "").strip()
-    if not raw_text:
-        await message.answer("❌ Введіть текст нагадування!\nПриклад: `/remind завтра о 15:00 Оплатити іпотеку`")
-        return
+# Натиснули "🔔 Додати нагадування"
+@dp.message(F.text == "🔔 Додати нагадування")
+async def start_add_reminder(message: types.Message, state: FSMContext):
+    await state.set_state(Form.waiting_for_reminder_title)
+    await message.answer("✍️ **Про що саме вам нагадати?**\n\n*Наприклад: Оплатити іпотеку, Запис на ТО, Купити ліки*")
+
+# Крок 1: Отримали опис нагадування
+@dp.message(Form.waiting_for_reminder_title)
+async def process_reminder_title(message: types.Message, state: FSMContext):
+    await state.update_data(title=message.text.strip())
+    await state.set_state(Form.waiting_for_reminder_date)
+    await message.answer(
+        "📅 **Коли нагадати?**\n\n"
+        "Напишіть у довільному форматі, наприклад:\n"
+        "• `завтра о 10:00`\n"
+        "• `через 2 години`\n"
+        "• `2026-11-25 15:00`"
+    )
+
+# Крок 2: Отримали дату і зберегли
+@dp.message(Form.waiting_for_reminder_date)
+async def process_reminder_date(message: types.Message, state: FSMContext):
+    user_data = await state.get_data()
+    title = user_data.get("title")
+    raw_date = message.text.strip()
     
     now = datetime.now()
     remind_time = None
-    title = raw_text
 
     # Формат YYYY-MM-DD HH:MM
-    match_date = re.match(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+(.*)", raw_text)
+    match_date = re.match(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", raw_date)
     if match_date:
-        remind_time = datetime.strptime(match_date.group(1), "%Y-%m-%d %H:%M")
-        title = match_date.group(2)
+        try:
+            remind_time = datetime.strptime(match_date.group(1), "%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
     
     # "завтра о/в HH:MM"
-    elif "завтра" in raw_text.lower():
-        match_time = re.search(r"завтра\s+(?:о|в)?\s*(\d{1,2}:\d{2})\s+(.*)", raw_text.lower())
+    elif "завтра" in raw_date.lower():
+        match_time = re.search(r"(\d{1,2}:\d{2})", raw_date.lower())
         if match_time:
             t_str = match_time.group(1)
-            title = match_time.group(2)
             h, m = map(int, t_str.split(":"))
             remind_time = (now + timedelta(days=1)).replace(hour=h, minute=m)
         
     # "через X годин/хвилин"
-    elif "через" in raw_text.lower():
-        match_hours = re.search(r"через\s+(\d+)\s+год", raw_text.lower())
-        match_mins = re.search(r"через\s+(\d+)\s+хв", raw_text.lower())
+    elif "через" in raw_date.lower():
+        match_hours = re.search(r"(\d+)\s+год", raw_date.lower())
+        match_mins = re.search(r"(\d+)\s+хв", raw_date.lower())
         if match_hours:
             hrs = int(match_hours.group(1))
             remind_time = now + timedelta(hours=hrs)
-            title = re.sub(r"через\s+\d+\s+год[а-я]*", "", raw_text, flags=re.IGNORECASE).strip()
         elif match_mins:
             mins = int(match_mins.group(1))
             remind_time = now + timedelta(minutes=mins)
-            title = re.sub(r"через\s+\d+\s+хв[а-я]*", "", raw_text, flags=re.IGNORECASE).strip()
 
     if not remind_time:
-        await message.answer(
-            "❌ Не вдалося розпізнати час.\nВикористовуйте формати:\n"
-            "• `/remind 2026-12-01 10:00 Іпотека`\n"
-            "• `/remind завтра о 15:00 Купити квитки`\n"
-            "• `/remind через 2 год Вимкнути газ`"
-        )
+        await message.answer("❌ Не вдалося розпізнати дату. Спробуйте ще раз (наприклад: `завтра о 15:00` або `2026-12-01 10:00`):")
         return
 
     full_date_str = remind_time.strftime("%Y-%m-%d %H:%M")
@@ -243,7 +271,9 @@ async def add_reminder(message: types.Message):
     conn.commit()
     conn.close()
     
-    await message.answer(f"🔔 Нагадування встановлено!\n📌 **{title}**\n📅 {full_date_str}", reply_markup=main_keyboard())
+    await state.clear()
+    await message.answer(f"🔔 **Нагадування встановлено!**\n\n📌 {title}\n📅 {full_date_str}", reply_markup=main_keyboard())
+
 
 # === ЗАПУСК ===
 async def main():
